@@ -1,10 +1,16 @@
-name: Build RSS Collector
+name: Build and Release RSS Collector
 
-# 触发条件：当推送到 main 分支，或者手动触发时
+# 触发条件修改：
+# 1. 当推送类似 'v*' 的标签时触发（例如 v1.0.0），用于正式发布
+# 2. workflow_dispatch 用于手动测试
 on:
   push:
-    branches: [ "main" ]
+    tags:
+      - 'v*'
   workflow_dispatch:
+
+permissions:
+  contents: write # 必须赋予写权限，否则无法创建 Release
 
 jobs:
   build:
@@ -12,10 +18,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        # 定义矩阵：同时在 Ubuntu, Windows, macOS 上运行
         os: [ubuntu-latest, windows-latest, macos-latest]
         include:
-          # 为不同系统定义输出文件名
           - os: ubuntu-latest
             output_name: rss_collector_linux_amd64
           - os: windows-latest
@@ -24,33 +28,65 @@ jobs:
             output_name: rss_collector_darwin_amd64
 
     steps:
-    # 1. 拉取代码
     - uses: actions/checkout@v4
 
-    # 2. 安装 Go 环境
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
         go-version: 'stable'
 
-    # 3. 初始化并下载依赖 (这里修改了)
-    # 强制在 CI 环境里初始化模块，解决找不到 go.mod 的报错
     - name: Init and Download dependencies
       run: |
-        go mod init rss-collector
-        go mod tidy
+        # 注意：如果有 go.mod 建议提交到仓库，而不是每次 init
+        # 这里保留你的逻辑以确保运行
+        if [ ! -f "go.mod" ]; then
+          go mod init rss-collector
+          go mod tidy
+        else 
+          echo "go.mod exists, just tidying"
+          go mod tidy
+        fi
+      shell: bash
 
-    # 4. 编译
     - name: Build Binary
       env:
-        CGO_ENABLED: 1 # 必须开启 CGO 以支持 sqlite3
+        CGO_ENABLED: 1
       run: |
         go build -v -o ${{ matrix.output_name }} main.go
 
-    # 5. 上传构建产物 (Artifacts)
+    # 上传构建产物作为临时文件，供下一个 job 使用
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: rss-collector-${{ matrix.os }}
+        name: binary-${{ matrix.os }} # 临时名称
         path: ${{ matrix.output_name }}
-        retention-days: 5
+        retention-days: 1
+
+  # 新增：发布 Job
+  release:
+    needs: build # 必须等待 build job 全部完成
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') # 只有打标签时才执行发布
+    
+    steps:
+      # 1. 下载上面 build job 上传的所有文件
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-* # 匹配上面上传的名字
+          path: assets        # 下载到 assets 文件夹
+          merge-multiple: true # 把所有文件合并到同一层目录，不要子文件夹
+
+      # 2. 查看一下文件（调试用，可删除）
+      - name: List files
+        run: ls -R assets
+
+      # 3. 创建 GitHub Release 并上传文件
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: assets/* # 上传 assets 文件夹下的所有文件
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
