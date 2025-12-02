@@ -98,7 +98,7 @@ func doRequest(method, reqUrl string, body io.Reader, headers map[string]string)
 	for i := 0; i < 3; i++ {
 		// 修复点：先创建默认 Client
 		client := &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout: 600 * time.Second,
 		}
 
 		// 1. 随机选择代理 (如果存在)
