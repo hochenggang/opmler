@@ -1,0 +1,56 @@
+name: Build RSS Collector
+
+# 触发条件：当推送到 main 分支，或者手动触发时
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # 定义矩阵：同时在 Ubuntu, Windows, macOS 上运行
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          # 为不同系统定义输出文件名
+          - os: ubuntu-latest
+            output_name: rss_collector_linux_amd64
+          - os: windows-latest
+            output_name: rss_collector_windows_amd64.exe
+          - os: macos-latest
+            output_name: rss_collector_darwin_amd64
+
+    steps:
+    # 1. 拉取代码
+    - uses: actions/checkout@v4
+
+    # 2. 安装 Go 环境
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 'stable'
+
+    # 3. 初始化并下载依赖 (这里修改了)
+    # 强制在 CI 环境里初始化模块，解决找不到 go.mod 的报错
+    - name: Init and Download dependencies
+      run: |
+        go mod init rss-collector
+        go mod tidy
+
+    # 4. 编译
+    - name: Build Binary
+      env:
+        CGO_ENABLED: 1 # 必须开启 CGO 以支持 sqlite3
+      run: |
+        go build -v -o ${{ matrix.output_name }} main.go
+
+    # 5. 上传构建产物 (Artifacts)
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: rss-collector-${{ matrix.os }}
+        path: ${{ matrix.output_name }}
+        retention-days: 5
