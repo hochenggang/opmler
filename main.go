@@ -43,10 +43,10 @@ type OPML struct {
 	XMLName xml.Name `xml:"opml"`
 	Body    struct {
 		Outlines []struct {
-			Text   string `xml:"text,attr"`
-			Title  string `xml:"title,attr"`
-			Type   string `xml:"type,attr"`
-			XMLUrl string `xml:"xmlUrl,attr"`
+			Text    string `xml:"text,attr"`
+			Title   string `xml:"title,attr"`
+			Type    string `xml:"type,attr"`
+			XMLUrl  string `xml:"xmlUrl,attr"`
 			HTMLUrl string `xml:"htmlUrl,attr"`
 		} `xml:"outline"`
 	} `xml:"body"`
@@ -70,9 +70,8 @@ type ArticleMeta struct {
 // --- 全局变量与工具 ---
 
 var (
-	httpClient *http.Client
-	proxies    []string
-	llmConf    *LLMConfig
+	proxies []string
+	llmConf *LLMConfig
 )
 
 // 初始化网络客户端
@@ -90,12 +89,6 @@ func initNetwork() {
 	if len(proxies) == 0 {
 		log.Println("未找到有效代理配置，使用直连模式")
 	}
-
-	// 基础 Client，具体的 Transport 在请求时动态决定（如果需要随机代理）
-	// 这里为了简单，我们自定义 doRequest 函数来处理代理逻辑
-	httpClient = &http.Client{
-		Timeout: 30 * time.Second,
-	}
 }
 
 // 指数退避重试请求
@@ -103,21 +96,21 @@ func doRequest(method, reqUrl string, body io.Reader, headers map[string]string)
 	var lastErr error
 
 	for i := 0; i < 3; i++ {
+		// 修复点：先创建默认 Client
+		client := &http.Client{
+			Timeout: 60 * time.Second,
+		}
+
 		// 1. 随机选择代理 (如果存在)
-		var transport *http.Transport
+		// 只有当存在代理时，才设置 Transport，否则保持 nil 以使用 DefaultTransport
 		if len(proxies) > 0 {
 			proxyUrlStr := proxies[rand.Intn(len(proxies))]
 			proxyUrl, err := url.Parse(proxyUrlStr)
 			if err == nil {
-				transport = &http.Transport{
+				client.Transport = &http.Transport{
 					Proxy: http.ProxyURL(proxyUrl),
 				}
 			}
-		}
-
-		client := &http.Client{
-			Timeout:   60 * time.Second,
-			Transport: transport, // 如果 nil 则使用默认
 		}
 
 		req, err := http.NewRequest(method, reqUrl, body)
@@ -180,7 +173,9 @@ func initDB(prefix string) (*DBManager, error) {
 		rss_url TEXT,
 		update_at DATETIME
 	)`)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	// 创建 Article 表
 	_, err = mgr.MetaDB.Exec(`CREATE TABLE IF NOT EXISTS article (
 		article_key TEXT PRIMARY KEY,
@@ -189,25 +184,35 @@ func initDB(prefix string) (*DBManager, error) {
 		article_published INTEGER,
 		article_author TEXT
 	)`)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 
 	// 2. Content DB
 	mgr.ContentDB, err = sql.Open("sqlite3", prefix+"_content.db")
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	_, err = mgr.ContentDB.Exec(`CREATE TABLE IF NOT EXISTS content_store (
 		key TEXT PRIMARY KEY,
 		value TEXT
 	)`)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 
 	// 3. LLM DB
 	mgr.LLMDB, err = sql.Open("sqlite3", prefix+"_llm.db")
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	_, err = mgr.LLMDB.Exec(`CREATE TABLE IF NOT EXISTS llm_store (
 		key TEXT PRIMARY KEY,
 		value TEXT
 	)`)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 
 	return mgr, nil
 }
@@ -246,10 +251,12 @@ func processOPML(opmlUrl string, mgr *DBManager) error {
 		if err == nil {
 			host = u.Host
 		}
-		
+
 		// 默认标题处理
 		title := outline.Title
-		if title == "" { title = outline.Text }
+		if title == "" {
+			title = outline.Text
+		}
 
 		log.Printf("入库 RSS: %s (%s)", title, host)
 		_, err = stmt.Exec(host, title, outline.XMLUrl, time.Now())
@@ -275,10 +282,6 @@ func processFeeds(mgr *DBManager) {
 	defer stmt.Close()
 
 	parser := gofeed.NewParser()
-	// 配置 gofeed 使用我们自定义的 Client (主要是为了复用我们的逻辑，但 gofeed 只需要 http.Client)
-	// 由于 gofeed 内部重试机制有限，我们这里手动 fetch 内容再 feed 给 parser 解析更稳妥
-	// 或者直接让 gofeed 使用默认 client，但这样没有代理。
-	// 最佳方案：手动 fetch XML，传给 parser.ParseString
 
 	type rssItem struct {
 		Host string
@@ -318,14 +321,16 @@ func processFeeds(mgr *DBManager) {
 					// 尝试补全
 					if !strings.HasPrefix(link, "http") {
 						scheme := "https" // 默认
-						if strings.HasPrefix(f.URL, "http:") { scheme = "http" }
+						if strings.HasPrefix(f.URL, "http:") {
+							scheme = "http"
+						}
 						link = fmt.Sprintf("%s://%s%s", scheme, f.Host, link)
 					}
 				}
 			}
 
 			key := md5Upper(link)
-			
+
 			// 处理时间
 			var pubTime int64
 			if item.PublishedParsed != nil {
@@ -370,13 +375,13 @@ func processContentAndLLM(mgr *DBManager) {
 
 	// 准备 Markdown 转换器
 	converter := md.NewConverter("", true, nil)
-	
+
 	// 查询是否已经存在内容，避免重复抓取
 	checkStmt, _ := mgr.ContentDB.Prepare("SELECT 1 FROM content_store WHERE key = ?")
-	
+
 	type task struct {
-		Key string
-		Link string
+		Key   string
+		Link  string
 		Title string
 	}
 	var tasks []task
@@ -420,10 +425,14 @@ func processContentAndLLM(mgr *DBManager) {
 
 	LLM_CHECK:
 		// 2. 检查是否已处理 LLM
-		if llmConf == nil { continue }
-		
+		if llmConf == nil {
+			continue
+		}
+
 		err = mgr.LLMDB.QueryRow("SELECT 1 FROM llm_store WHERE key = ?", t.Key).Scan(&exists)
-		if err == nil { continue } // 已有摘要
+		if err == nil {
+			continue
+		} // 已有摘要
 
 		// 获取刚才存入或已存在的 Markdown
 		var content string
@@ -464,9 +473,9 @@ func callLLM(articleContent string) (string, error) {
 		},
 		"stream": false,
 	}
-	
+
 	jsonPayload, _ := json.Marshal(payload)
-	
+
 	// 轮询 Key
 	apiKey := ""
 	if len(llmConf.ApiKeys) > 0 {
@@ -474,7 +483,7 @@ func callLLM(articleContent string) (string, error) {
 	}
 
 	headers := map[string]string{
-		"Content-Type": "application/json",
+		"Content-Type":  "application/json",
 		"Authorization": apiKey, // 注意：如果 apiKey 没带 Bearer 前缀，需在此处处理。配置里已带。
 	}
 
