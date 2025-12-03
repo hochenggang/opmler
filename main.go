@@ -17,10 +17,11 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	md "github.com/JohannesKaufmann/html-to-markdown"
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/go-sql-driver/mysql" // MySQL 驱动
 	"github.com/mmcdole/gofeed"
 )
 
@@ -28,6 +29,17 @@ import (
 
 type ProxyConfig struct {
 	Proxies []string `json:"proxies"`
+}
+
+type DBConfig struct {
+	MySQL struct {
+		Host     string `json:"host"`
+		Port     int    `json:"port"`
+		User     string `json:"user"`
+		Password string `json:"password"`
+		Database string `json:"database"`
+		Charset  string `json:"charset"`
+	} `json:"mysql"`
 }
 
 type LLMConfig struct {
@@ -52,31 +64,17 @@ type OPML struct {
 	} `xml:"body"`
 }
 
-type RSSMeta struct {
-	Host     string
-	Title    string
-	URL      string
-	UpdateAt time.Time
-}
-
-type ArticleMeta struct {
-	Key       string
-	Link      string
-	Title     string
-	Published int64
-	Author    string
-}
-
 // --- 全局变量与工具 ---
 
 var (
 	proxies []string
 	llmConf *LLMConfig
+	// 全局并发信号量
+	concurrencySem chan struct{}
 )
 
-// 初始化网络客户端
+// 初始化网络客户端配置
 func initNetwork() {
-	// 1. 读取代理配置
 	file, err := os.ReadFile("./proxys.json")
 	if err == nil {
 		var pc ProxyConfig
@@ -96,29 +94,29 @@ func doRequest(method, reqUrl string, body io.Reader, headers map[string]string)
 	var lastErr error
 
 	for i := 0; i < 3; i++ {
-		// 修复点：先创建默认 Client
+		// 创建基础 Client
 		client := &http.Client{
-			Timeout: 600 * time.Second,
+			Timeout: 60 * time.Second,
 		}
 
-		// 1. 随机选择代理 (如果存在)
-		// 只有当存在代理时，才设置 Transport，否则保持 nil 以使用 DefaultTransport
+		// 动态设置代理
 		if len(proxies) > 0 {
 			proxyUrlStr := proxies[rand.Intn(len(proxies))]
 			proxyUrl, err := url.Parse(proxyUrlStr)
 			if err == nil {
+				// 只有当解析成功时才设置 Transport
 				client.Transport = &http.Transport{
 					Proxy: http.ProxyURL(proxyUrl),
 				}
 			}
 		}
+		// 如果没有代理，client.Transport 保持为 nil，Go 会自动使用 DefaultTransport
 
 		req, err := http.NewRequest(method, reqUrl, body)
 		if err != nil {
 			return nil, err
 		}
 
-		// 设置默认 User-Agent
 		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; RSSCollector/1.0)")
 		for k, v := range headers {
 			req.Header.Set(k, v)
@@ -143,7 +141,7 @@ func doRequest(method, reqUrl string, body io.Reader, headers map[string]string)
 	return nil, fmt.Errorf("request failed after 3 retries: %v", lastErr)
 }
 
-// 辅助：生成大写 MD5
+// 生成大写 MD5
 func md5Upper(s string) string {
 	hash := md5.Sum([]byte(s))
 	return strings.ToUpper(hex.EncodeToString(hash[:]))
@@ -152,80 +150,96 @@ func md5Upper(s string) string {
 // --- 数据库管理 ---
 
 type DBManager struct {
-	MetaDB    *sql.DB
-	ContentDB *sql.DB
-	LLMDB     *sql.DB
+	DB *sql.DB
 }
 
-func initDB(prefix string) (*DBManager, error) {
-	mgr := &DBManager{}
-	var err error
+func initDB() (*DBManager, error) {
+	// 读取 db.json
+	file, err := os.ReadFile("./db.json")
+	if err != nil {
+		return nil, fmt.Errorf("读取 db.json 失败: %v", err)
+	}
+	var cfg DBConfig
+	if err := json.Unmarshal(file, &cfg); err != nil {
+		return nil, fmt.Errorf("解析 db.json 失败: %v", err)
+	}
 
-	// 1. Meta DB
-	mgr.MetaDB, err = sql.Open("sqlite3", prefix+"_meta.db")
+	// 构建 DSN (Data Source Name)
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=%s&parseTime=True&loc=Local",
+		cfg.MySQL.User,
+		cfg.MySQL.Password,
+		cfg.MySQL.Host,
+		cfg.MySQL.Port,
+		cfg.MySQL.Database,
+		cfg.MySQL.Charset,
+	)
+
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, err
 	}
-	// 创建 RSS 表
-	_, err = mgr.MetaDB.Exec(`CREATE TABLE IF NOT EXISTS rss (
-		rss_host TEXT PRIMARY KEY,
-		rss_title TEXT,
+
+	// 测试连接
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("连接数据库失败: %v", err)
+	}
+	log.Println("成功连接到 MySQL 数据库")
+
+	mgr := &DBManager{DB: db}
+
+	// 创建 RSS 表 (适配 MySQL: 使用 VARCHAR 作为主键)
+	_, err = mgr.DB.Exec(`CREATE TABLE IF NOT EXISTS rss (
+		rss_host VARCHAR(255) PRIMARY KEY,
+		rss_title VARCHAR(255),
 		rss_url TEXT,
 		update_at DATETIME
-	)`)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("创建 rss 表失败: %v", err)
 	}
+
 	// 创建 Article 表
-	_, err = mgr.MetaDB.Exec(`CREATE TABLE IF NOT EXISTS article (
-		article_key TEXT PRIMARY KEY,
+	_, err = mgr.DB.Exec(`CREATE TABLE IF NOT EXISTS article (
+		article_key CHAR(32) PRIMARY KEY,
 		article_link TEXT,
-		article_title TEXT,
-		article_published INTEGER,
-		article_author TEXT
-	)`)
+		article_title VARCHAR(512),
+		article_published BIGINT,
+		article_author VARCHAR(255)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("创建 article 表失败: %v", err)
 	}
 
-	// 2. Content DB
-	mgr.ContentDB, err = sql.Open("sqlite3", prefix+"_content.db")
+	// 创建 Content 表
+	_, err = mgr.DB.Exec(`CREATE TABLE IF NOT EXISTS content_store (
+		article_key CHAR(32) PRIMARY KEY,
+		value LONGTEXT
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
 	if err != nil {
-		return nil, err
-	}
-	_, err = mgr.ContentDB.Exec(`CREATE TABLE IF NOT EXISTS content_store (
-		key TEXT PRIMARY KEY,
-		value TEXT
-	)`)
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("创建 content_store 表失败: %v", err)
 	}
 
-	// 3. LLM DB
-	mgr.LLMDB, err = sql.Open("sqlite3", prefix+"_llm.db")
-	if err != nil {
-		return nil, err
-	}
-	_, err = mgr.LLMDB.Exec(`CREATE TABLE IF NOT EXISTS llm_store (
-		key TEXT PRIMARY KEY,
+	// 创建 LLM 表
+	_, err = mgr.DB.Exec(`CREATE TABLE IF NOT EXISTS llm_store (
+		article_key CHAR(32) PRIMARY KEY,
 		value TEXT
-	)`)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("创建 llm_store 表失败: %v", err)
 	}
 
 	return mgr, nil
 }
 
 func (mgr *DBManager) Close() {
-	mgr.MetaDB.Close()
-	mgr.ContentDB.Close()
-	mgr.LLMDB.Close()
+	if mgr.DB != nil {
+		mgr.DB.Close()
+	}
 }
 
 // --- 核心业务逻辑 ---
 
-// 第一步 & 第三步.1: 获取 OPML 并入库
+// 第一步: 获取 OPML 并入库 (串行)
 func processOPML(opmlUrl string, mgr *DBManager) error {
 	log.Println("正在获取 OPML...", opmlUrl)
 	data, err := doRequest("GET", opmlUrl, nil, nil)
@@ -238,8 +252,11 @@ func processOPML(opmlUrl string, mgr *DBManager) error {
 		return err
 	}
 
-	tx, _ := mgr.MetaDB.Begin()
-	stmt, _ := tx.Prepare("INSERT OR REPLACE INTO rss (rss_host, rss_title, rss_url, update_at) VALUES (?, ?, ?, ?)")
+	// 使用 REPLACE INTO 处理重复更新
+	stmt, err := mgr.DB.Prepare("REPLACE INTO rss (rss_host, rss_title, rss_url, update_at) VALUES (?, ?, ?, ?)")
+	if err != nil {
+		return err
+	}
 	defer stmt.Close()
 
 	for _, outline := range opml.Body.Outlines {
@@ -252,7 +269,6 @@ func processOPML(opmlUrl string, mgr *DBManager) error {
 			host = u.Host
 		}
 
-		// 默认标题处理
 		title := outline.Title
 		if title == "" {
 			title = outline.Text
@@ -264,24 +280,17 @@ func processOPML(opmlUrl string, mgr *DBManager) error {
 			log.Printf("RSS入库失败: %v", err)
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
-// 第三步.2: 遍历 RSS 并采集文章元数据
+// 第二步: 遍历 RSS 并采集文章元数据 (并发)
 func processFeeds(mgr *DBManager) {
-	rows, err := mgr.MetaDB.Query("SELECT rss_host, rss_url FROM rss")
+	rows, err := mgr.DB.Query("SELECT rss_host, rss_url FROM rss")
 	if err != nil {
 		log.Println("无法查询 RSS 表:", err)
 		return
 	}
 	defer rows.Close()
-
-	// 预编译插入语句
-	tx, _ := mgr.MetaDB.Begin()
-	stmt, _ := tx.Prepare(`INSERT OR IGNORE INTO article (article_key, article_link, article_title, article_published, article_author) VALUES (?, ?, ?, ?, ?)`)
-	defer stmt.Close()
-
-	parser := gofeed.NewParser()
 
 	type rssItem struct {
 		Host string
@@ -295,69 +304,89 @@ func processFeeds(mgr *DBManager) {
 	}
 	rows.Close()
 
+	// 并发控制 WaitGroup
+	var wg sync.WaitGroup
+
 	for _, f := range feeds {
-		log.Printf("正在解析 RSS: %s", f.URL)
-		xmlData, err := doRequest("GET", f.URL, nil, nil)
-		if err != nil {
-			log.Printf("获取 RSS 失败 %s: %v", f.URL, err)
-			continue
-		}
+		wg.Add(1)
+		// 获取信号量 (占用一个并发名额)
+		concurrencySem <- struct{}{}
 
-		feed, err := parser.ParseString(string(xmlData))
-		if err != nil {
-			log.Printf("解析 XML 失败 %s: %v", f.URL, err)
-			continue
-		}
+		// 启动 Goroutine
+		go func(feedInfo rssItem) {
+			defer wg.Done()
+			defer func() { <-concurrencySem }() // 释放信号量
 
-		for _, item := range feed.Items {
-			link := item.Link
-			// 补全链接
-			if link == "" {
-				continue
+			log.Printf("正在解析 RSS: %s", feedInfo.URL)
+			// 注意：gofeed Parser 最好在协程内新建，确保线程安全
+			parser := gofeed.NewParser()
+
+			xmlData, err := doRequest("GET", feedInfo.URL, nil, nil)
+			if err != nil {
+				log.Printf("获取 RSS 失败 %s: %v", feedInfo.URL, err)
+				return
 			}
-			u, err := url.Parse(link)
-			if err == nil {
-				if u.Scheme == "" || u.Host == "" {
-					// 尝试补全
-					if !strings.HasPrefix(link, "http") {
-						scheme := "https" // 默认
-						if strings.HasPrefix(f.URL, "http:") {
-							scheme = "http"
+
+			feed, err := parser.ParseString(string(xmlData))
+			if err != nil {
+				log.Printf("解析 XML 失败 %s: %v", feedInfo.URL, err)
+				return
+			}
+
+			// 遍历文章并入库
+			for _, item := range feed.Items {
+				link := item.Link
+				if link == "" {
+					continue
+				}
+				u, err := url.Parse(link)
+				if err == nil {
+					// 补全相对路径链接
+					if u.Scheme == "" || u.Host == "" {
+						if !strings.HasPrefix(link, "http") {
+							scheme := "https"
+							if strings.HasPrefix(feedInfo.URL, "http:") {
+								scheme = "http"
+							}
+							link = fmt.Sprintf("%s://%s%s", scheme, feedInfo.Host, link)
 						}
-						link = fmt.Sprintf("%s://%s%s", scheme, f.Host, link)
 					}
 				}
-			}
 
-			key := md5Upper(link)
+				key := md5Upper(link)
+				var pubTime int64
+				if item.PublishedParsed != nil {
+					pubTime = item.PublishedParsed.Unix()
+				} else if item.UpdatedParsed != nil {
+					pubTime = item.UpdatedParsed.Unix()
+				} else {
+					pubTime = time.Now().Unix()
+				}
 
-			// 处理时间
-			var pubTime int64
-			if item.PublishedParsed != nil {
-				pubTime = item.PublishedParsed.Unix()
-			} else if item.UpdatedParsed != nil {
-				pubTime = item.UpdatedParsed.Unix()
-			} else {
-				pubTime = time.Now().Unix()
-			}
+				author := ""
+				if item.Author != nil {
+					author = item.Author.Name
+				} else if len(item.Authors) > 0 {
+					author = item.Authors[0].Name
+				}
 
-			author := ""
-			if item.Author != nil {
-				author = item.Author.Name
-			} else if len(item.Authors) > 0 {
-				author = item.Authors[0].Name
+				// 使用 INSERT IGNORE 忽略已存在的文章
+				_, err = mgr.DB.Exec(`INSERT IGNORE INTO article 
+					(article_key, article_link, article_title, article_published, article_author) 
+					VALUES (?, ?, ?, ?, ?)`,
+					key, link, item.Title, pubTime, author)
+				
+				if err != nil {
+					log.Printf("文章元数据插入错误: %v", err)
+				}
 			}
-
-			_, err = stmt.Exec(key, link, item.Title, pubTime, author)
-			if err != nil {
-				log.Printf("文章元数据插入错误: %v", err)
-			}
-		}
+		}(f)
 	}
-	tx.Commit()
+
+	wg.Wait()
 }
 
-// 第三步.3: 获取正文 -> 转 Markdown -> LLM 摘要
+// 第三步: 获取正文 -> 转 Markdown -> LLM 摘要 (并发)
 func processContentAndLLM(mgr *DBManager) {
 	// 加载 LLM 配置
 	llmData, err := os.ReadFile("./llm.json")
@@ -366,18 +395,12 @@ func processContentAndLLM(mgr *DBManager) {
 		json.Unmarshal(llmData, llmConf)
 	}
 
-	rows, err := mgr.MetaDB.Query("SELECT article_key, article_link, article_title FROM article")
+	rows, err := mgr.DB.Query("SELECT article_key, article_link, article_title FROM article")
 	if err != nil {
 		log.Println(err)
 		return
 	}
 	defer rows.Close()
-
-	// 准备 Markdown 转换器
-	converter := md.NewConverter("", true, nil)
-
-	// 查询是否已经存在内容，避免重复抓取
-	checkStmt, _ := mgr.ContentDB.Prepare("SELECT 1 FROM content_store WHERE key = ?")
 
 	type task struct {
 		Key   string
@@ -392,75 +415,82 @@ func processContentAndLLM(mgr *DBManager) {
 	}
 	rows.Close()
 
+	var wg sync.WaitGroup
+
 	for _, t := range tasks {
-		// 1. 检查是否已处理 Content
-		var exists int
-		err := checkStmt.QueryRow(t.Key).Scan(&exists)
-		if err == nil {
-			// 内容已存在，跳过抓取，但检查 LLM
-			goto LLM_CHECK
-		}
+		wg.Add(1)
+		concurrencySem <- struct{}{}
 
-		{
-			log.Printf("正在抓取正文: %s", t.Title)
-			htmlBytes, err := doRequest("GET", t.Link, nil, nil)
+		go func(taskItem task) {
+			defer wg.Done()
+			defer func() { <-concurrencySem }()
+
+			// 1. 检查是否已处理 Content
+			var exists int
+			err := mgr.DB.QueryRow("SELECT 1 FROM content_store WHERE article_key = ?", taskItem.Key).Scan(&exists)
+			
+			// 如果不存在正文，则抓取
 			if err != nil {
-				log.Printf("抓取失败: %v", err)
-				continue
+				log.Printf("正在抓取正文: %s", taskItem.Title)
+				htmlBytes, err := doRequest("GET", taskItem.Link, nil, nil)
+				if err != nil {
+					log.Printf("抓取失败 [%s]: %v", taskItem.Title, err)
+					return
+				}
+
+				// 转 Markdown
+				converter := md.NewConverter("", true, nil)
+				markdown, err := converter.ConvertString(string(htmlBytes))
+				if err != nil {
+					log.Printf("Markdown 转换失败: %v", err)
+					markdown = "Conversion Failed"
+				}
+
+				// REPLACE INTO
+				_, err = mgr.DB.Exec("REPLACE INTO content_store (article_key, value) VALUES (?, ?)", taskItem.Key, markdown)
+				if err != nil {
+					log.Printf("Content 存储失败: %v", err)
+				}
 			}
 
-			// 转 Markdown
-			markdown, err := converter.ConvertString(string(htmlBytes))
-			if err != nil {
-				log.Printf("Markdown 转换失败: %v", err)
-				markdown = "Conversion Failed" // 占位
+			// 2. 检查是否已处理 LLM
+			if llmConf == nil {
+				return
 			}
 
-			// 存入 Content DB
-			_, err = mgr.ContentDB.Exec("INSERT OR REPLACE INTO content_store (key, value) VALUES (?, ?)", t.Key, markdown)
-			if err != nil {
-				log.Printf("Content 存储失败: %v", err)
+			err = mgr.DB.QueryRow("SELECT 1 FROM llm_store WHERE article_key = ?", taskItem.Key).Scan(&exists)
+			if err == nil {
+				return // 已有摘要
 			}
-		}
 
-	LLM_CHECK:
-		// 2. 检查是否已处理 LLM
-		if llmConf == nil {
-			continue
-		}
+			// 获取 Markdown 用于生成摘要
+			var content string
+			err = mgr.DB.QueryRow("SELECT value FROM content_store WHERE article_key = ?", taskItem.Key).Scan(&content)
+			if err != nil || len(content) < 50 {
+				return
+			}
 
-		err = mgr.LLMDB.QueryRow("SELECT 1 FROM llm_store WHERE key = ?", t.Key).Scan(&exists)
-		if err == nil {
-			continue
-		} // 已有摘要
+			// 调用 LLM
+			log.Printf("正在生成摘要: %s", taskItem.Title)
+			summary, err := callLLM(content)
+			if err != nil {
+				log.Printf("LLM 调用失败 [%s]: %v", taskItem.Title, err)
+				return
+			}
 
-		// 获取刚才存入或已存在的 Markdown
-		var content string
-		err = mgr.ContentDB.QueryRow("SELECT value FROM content_store WHERE key = ?", t.Key).Scan(&content)
-		if err != nil || len(content) < 50 {
-			log.Println("内容太短或未找到，跳过 LLM")
-			continue
-		}
-
-		// 调用 LLM
-		log.Printf("正在生成摘要: %s", t.Title)
-		summary, err := callLLM(content)
-		if err != nil {
-			log.Printf("LLM 调用失败: %v", err)
-			continue
-		}
-
-		// 存入 LLM DB
-		_, err = mgr.LLMDB.Exec("INSERT OR REPLACE INTO llm_store (key, value) VALUES (?, ?)", t.Key, summary)
-		if err != nil {
-			log.Printf("LLM 结果存储失败: %v", err)
-		}
+			_, err = mgr.DB.Exec("REPLACE INTO llm_store (article_key, value) VALUES (?, ?)", taskItem.Key, summary)
+			if err != nil {
+				log.Printf("LLM 结果存储失败: %v", err)
+			}
+		}(t)
 	}
+
+	wg.Wait()
 }
 
 // 调用 LLM API
 func callLLM(articleContent string) (string, error) {
-	// 截断内容以防止 token 溢出 (假设简单截断，实际应按 token 计算)
+	// 简单截断防止 Token 溢出
 	if len(articleContent) > 12000 {
 		articleContent = articleContent[:12000]
 	}
@@ -476,7 +506,6 @@ func callLLM(articleContent string) (string, error) {
 
 	jsonPayload, _ := json.Marshal(payload)
 
-	// 轮询 Key
 	apiKey := ""
 	if len(llmConf.ApiKeys) > 0 {
 		apiKey = llmConf.ApiKeys[rand.Intn(len(llmConf.ApiKeys))]
@@ -484,7 +513,7 @@ func callLLM(articleContent string) (string, error) {
 
 	headers := map[string]string{
 		"Content-Type":  "application/json",
-		"Authorization": apiKey, // 注意：如果 apiKey 没带 Bearer 前缀，需在此处处理。配置里已带。
+		"Authorization": apiKey,
 	}
 
 	respBytes, err := doRequest("POST", llmConf.Server, bytes.NewBuffer(jsonPayload), headers)
@@ -492,7 +521,6 @@ func callLLM(articleContent string) (string, error) {
 		return "", err
 	}
 
-	// 解析响应 (适配 OpenAI 格式)
 	var resp struct {
 		Choices []struct {
 			Message struct {
@@ -522,9 +550,9 @@ func callLLM(articleContent string) (string, error) {
 // --- 主程序入口 ---
 
 func main() {
-	// 第一步：解析参数
 	opmlUrl := flag.String("url", "", "OPML 文件的 URL 地址")
-	dbName := flag.String("db", "default", "数据库文件名前缀")
+	concurrency := flag.Int("c", 1, "并发控制数 (默认为 1)")
+	// 注意: -db 参数不再控制文件名，数据库配置现由 db.json 接管
 	flag.Parse()
 
 	if *opmlUrl == "" {
@@ -532,29 +560,36 @@ func main() {
 		return
 	}
 
+	// 初始化并发信号量
+	if *concurrency < 1 {
+		*concurrency = 1
+	}
+	concurrencySem = make(chan struct{}, *concurrency)
+
+	// 随机种子初始化 (Go 1.20+ 自动处理，此处保留兼容性)
 	rand.Seed(time.Now().UnixNano())
+	
 	initNetwork()
 
-	// 第二步：创建数据库
-	log.Printf("初始化数据库: %s_*.db", *dbName)
-	mgr, err := initDB(*dbName)
+	// 1. 初始化数据库 (连接 MySQL)
+	log.Println("正在连接 MySQL 数据库...")
+	mgr, err := initDB()
 	if err != nil {
 		log.Fatalf("数据库初始化失败: %v", err)
 	}
 	defer mgr.Close()
 
-	// 第三步：执行
-	// 1. 获取 OPML
+	// 2. 获取 OPML
 	if err := processOPML(*opmlUrl, mgr); err != nil {
 		log.Fatalf("处理 OPML 失败: %v", err)
 	}
 
-	// 2. 遍历 RSS
-	log.Println("开始采集 RSS Feed...")
+	// 3. 遍历 RSS
+	log.Printf("开始采集 RSS Feed (并发数: %d)...", *concurrency)
 	processFeeds(mgr)
 
-	// 3. 抓取正文与生成摘要
-	log.Println("开始处理正文与 AI 摘要...")
+	// 4. 抓取正文与生成摘要
+	log.Printf("开始处理正文与 AI 摘要 (并发数: %d)...", *concurrency)
 	processContentAndLLM(mgr)
 
 	log.Println("所有任务执行完毕。")
