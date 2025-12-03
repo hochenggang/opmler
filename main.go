@@ -96,7 +96,7 @@ func doRequest(method, reqUrl string, body io.Reader, headers map[string]string)
 	for i := 0; i < 3; i++ {
 		// 创建基础 Client
 		client := &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout: 600 * time.Second,
 		}
 
 		// 动态设置代理
@@ -239,9 +239,9 @@ func (mgr *DBManager) Close() {
 
 // --- 核心业务逻辑 ---
 
-// 第一步: 获取 OPML 并入库 (串行)
+// 步骤 1: 获取 OPML 并入库 (串行)
 func processOPML(opmlUrl string, mgr *DBManager) error {
-	log.Println("正在获取 OPML...", opmlUrl)
+	log.Println("[步骤1] 正在获取 OPML...", opmlUrl)
 	data, err := doRequest("GET", opmlUrl, nil, nil)
 	if err != nil {
 		return err
@@ -259,6 +259,7 @@ func processOPML(opmlUrl string, mgr *DBManager) error {
 	}
 	defer stmt.Close()
 
+	count := 0
 	for _, outline := range opml.Body.Outlines {
 		if outline.XMLUrl == "" {
 			continue
@@ -274,17 +275,20 @@ func processOPML(opmlUrl string, mgr *DBManager) error {
 			title = outline.Text
 		}
 
-		log.Printf("入库 RSS: %s (%s)", title, host)
 		_, err = stmt.Exec(host, title, outline.XMLUrl, time.Now())
 		if err != nil {
 			log.Printf("RSS入库失败: %v", err)
+		} else {
+			count++
 		}
 	}
+	log.Printf("[步骤1] 完成，共处理 %d 个 RSS 源", count)
 	return nil
 }
 
-// 第二步: 遍历 RSS 并采集文章元数据 (并发)
+// 步骤 2: 遍历 RSS 并采集文章元数据 (并发)
 func processFeeds(mgr *DBManager) {
+	log.Println("[步骤2] 开始解析 RSS 订阅源...")
 	rows, err := mgr.DB.Query("SELECT rss_host, rss_url FROM rss")
 	if err != nil {
 		log.Println("无法查询 RSS 表:", err)
@@ -304,21 +308,16 @@ func processFeeds(mgr *DBManager) {
 	}
 	rows.Close()
 
-	// 并发控制 WaitGroup
 	var wg sync.WaitGroup
-
 	for _, f := range feeds {
 		wg.Add(1)
-		// 获取信号量 (占用一个并发名额)
 		concurrencySem <- struct{}{}
 
-		// 启动 Goroutine
 		go func(feedInfo rssItem) {
 			defer wg.Done()
-			defer func() { <-concurrencySem }() // 释放信号量
+			defer func() { <-concurrencySem }()
 
 			log.Printf("正在解析 RSS: %s", feedInfo.URL)
-			// 注意：gofeed Parser 最好在协程内新建，确保线程安全
 			parser := gofeed.NewParser()
 
 			xmlData, err := doRequest("GET", feedInfo.URL, nil, nil)
@@ -333,7 +332,6 @@ func processFeeds(mgr *DBManager) {
 				return
 			}
 
-			// 遍历文章并入库
 			for _, item := range feed.Items {
 				link := item.Link
 				if link == "" {
@@ -370,7 +368,6 @@ func processFeeds(mgr *DBManager) {
 					author = item.Authors[0].Name
 				}
 
-				// 使用 INSERT IGNORE 忽略已存在的文章
 				_, err = mgr.DB.Exec(`INSERT IGNORE INTO article 
 					(article_key, article_link, article_title, article_published, article_author) 
 					VALUES (?, ?, ?, ?, ?)`,
@@ -382,19 +379,13 @@ func processFeeds(mgr *DBManager) {
 			}
 		}(f)
 	}
-
 	wg.Wait()
+	log.Println("[步骤2] RSS 解析完成")
 }
 
-// 第三步: 获取正文 -> 转 Markdown -> LLM 摘要 (并发)
-func processContentAndLLM(mgr *DBManager) {
-	// 加载 LLM 配置
-	llmData, err := os.ReadFile("./llm.json")
-	if err == nil {
-		llmConf = &LLMConfig{}
-		json.Unmarshal(llmData, llmConf)
-	}
-
+// 步骤 3: 获取正文 -> 转 Markdown (并发)
+func processContent(mgr *DBManager) {
+	log.Println("[步骤3] 开始抓取正文并清洗为 Markdown...")
 	rows, err := mgr.DB.Query("SELECT article_key, article_link, article_title FROM article")
 	if err != nil {
 		log.Println(err)
@@ -425,47 +416,97 @@ func processContentAndLLM(mgr *DBManager) {
 			defer wg.Done()
 			defer func() { <-concurrencySem }()
 
-			// 1. 检查是否已处理 Content
+			// 检查是否已存在正文
 			var exists int
 			err := mgr.DB.QueryRow("SELECT 1 FROM content_store WHERE article_key = ?", taskItem.Key).Scan(&exists)
 			
-			// 如果不存在正文，则抓取
-			if err != nil {
-				log.Printf("正在抓取正文: %s", taskItem.Title)
-				htmlBytes, err := doRequest("GET", taskItem.Link, nil, nil)
-				if err != nil {
-					log.Printf("抓取失败 [%s]: %v", taskItem.Title, err)
-					return
-				}
-
-				// 转 Markdown
-				converter := md.NewConverter("", true, nil)
-				markdown, err := converter.ConvertString(string(htmlBytes))
-				if err != nil {
-					log.Printf("Markdown 转换失败: %v", err)
-					markdown = "Conversion Failed"
-				}
-
-				// REPLACE INTO
-				_, err = mgr.DB.Exec("REPLACE INTO content_store (article_key, value) VALUES (?, ?)", taskItem.Key, markdown)
-				if err != nil {
-					log.Printf("Content 存储失败: %v", err)
-				}
-			}
-
-			// 2. 检查是否已处理 LLM
-			if llmConf == nil {
+			// 如果存在则跳过
+			if err == nil {
 				return
 			}
 
-			err = mgr.DB.QueryRow("SELECT 1 FROM llm_store WHERE article_key = ?", taskItem.Key).Scan(&exists)
-			if err == nil {
-				return // 已有摘要
+			log.Printf("正在抓取正文: %s", taskItem.Title)
+			htmlBytes, err := doRequest("GET", taskItem.Link, nil, nil)
+			if err != nil {
+				log.Printf("抓取失败 [%s]: %v", taskItem.Title, err)
+				return
 			}
 
-			// 获取 Markdown 用于生成摘要
+			// 转 Markdown
+			converter := md.NewConverter("", true, nil)
+			markdown, err := converter.ConvertString(string(htmlBytes))
+			if err != nil {
+				log.Printf("Markdown 转换失败: %v", err)
+				markdown = "Conversion Failed"
+			}
+
+			// 存储
+			_, err = mgr.DB.Exec("REPLACE INTO content_store (article_key, value) VALUES (?, ?)", taskItem.Key, markdown)
+			if err != nil {
+				log.Printf("Content 存储失败: %v", err)
+			}
+		}(t)
+	}
+	wg.Wait()
+	log.Println("[步骤3] 正文抓取完成")
+}
+
+// 步骤 4: 读取正文 -> 生成 LLM 摘要 (并发)
+func processLLM(mgr *DBManager) {
+	log.Println("[步骤4] 开始生成 LLM 摘要...")
+	// 加载 LLM 配置
+	llmData, err := os.ReadFile("./llm.json")
+	if err != nil {
+		log.Printf("跳过 LLM 步骤: 无法读取 llm.json: %v", err)
+		return
+	}
+	llmConf = &LLMConfig{}
+	json.Unmarshal(llmData, llmConf)
+
+	// 只查询有正文且未生成摘要的文章
+	// 为了方便日志显示标题，我们联表查询，或者这里简单点：查询 article 表，然后查 content
+	rows, err := mgr.DB.Query("SELECT article_key, article_link, article_title FROM article")
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	defer rows.Close()
+
+	type task struct {
+		Key   string
+		Link  string
+		Title string
+	}
+	var tasks []task
+	for rows.Next() {
+		var t task
+		rows.Scan(&t.Key, &t.Link, &t.Title)
+		tasks = append(tasks, t)
+	}
+	rows.Close()
+
+	var wg sync.WaitGroup
+
+	for _, t := range tasks {
+		wg.Add(1)
+		concurrencySem <- struct{}{}
+
+		go func(taskItem task) {
+			defer wg.Done()
+			defer func() { <-concurrencySem }()
+
+			// 1. 检查是否已有摘要
+			var exists int
+			err := mgr.DB.QueryRow("SELECT 1 FROM llm_store WHERE article_key = ?", taskItem.Key).Scan(&exists)
+			if err == nil {
+				return // 已有摘要，跳过
+			}
+
+			// 2. 获取正文 Markdown
 			var content string
 			err = mgr.DB.QueryRow("SELECT value FROM content_store WHERE article_key = ?", taskItem.Key).Scan(&content)
+			
+			// 如果没有正文或正文太短，无法生成摘要
 			if err != nil || len(content) < 50 {
 				return
 			}
@@ -484,8 +525,8 @@ func processContentAndLLM(mgr *DBManager) {
 			}
 		}(t)
 	}
-
 	wg.Wait()
+	log.Println("[步骤4] 摘要生成完成")
 }
 
 // 调用 LLM API
@@ -550,13 +591,14 @@ func callLLM(articleContent string) (string, error) {
 // --- 主程序入口 ---
 
 func main() {
-	opmlUrl := flag.String("url", "", "OPML 文件的 URL 地址")
+	opmlUrl := flag.String("url", "", "OPML 文件的 URL 地址 (仅步骤 0,1 需要)")
 	concurrency := flag.Int("c", 1, "并发控制数 (默认为 1)")
-	// 注意: -db 参数不再控制文件名，数据库配置现由 db.json 接管
+	step := flag.Int("step", 0, "运行步骤: 0=全部, 1=获取OPML, 2=解析RSS, 3=抓取正文, 4=LLM摘要")
 	flag.Parse()
 
-	if *opmlUrl == "" {
-		fmt.Println("请提供 -url 参数")
+	// 仅在步骤 0 或 1 且未提供 URL 时报错
+	if (*step == 0 || *step == 1) && *opmlUrl == "" {
+		fmt.Println("错误: 运行步骤 0 或 1 时必须提供 -url 参数")
 		return
 	}
 
@@ -566,12 +608,9 @@ func main() {
 	}
 	concurrencySem = make(chan struct{}, *concurrency)
 
-	// 随机种子初始化 (Go 1.20+ 自动处理，此处保留兼容性)
 	rand.Seed(time.Now().UnixNano())
-	
 	initNetwork()
 
-	// 1. 初始化数据库 (连接 MySQL)
 	log.Println("正在连接 MySQL 数据库...")
 	mgr, err := initDB()
 	if err != nil {
@@ -579,18 +618,30 @@ func main() {
 	}
 	defer mgr.Close()
 
-	// 2. 获取 OPML
-	if err := processOPML(*opmlUrl, mgr); err != nil {
-		log.Fatalf("处理 OPML 失败: %v", err)
+	// 步骤分发逻辑
+	// 如果是 0，则所有条件都满足；如果是具体数字，则只满足对应条件
+	
+	// Step 1: OPML 获取
+	if *step == 0 || *step == 1 {
+		if err := processOPML(*opmlUrl, mgr); err != nil {
+			log.Fatalf("处理 OPML 失败: %v", err)
+		}
 	}
 
-	// 3. 遍历 RSS
-	log.Printf("开始采集 RSS Feed (并发数: %d)...", *concurrency)
-	processFeeds(mgr)
+	// Step 2: RSS 解析
+	if *step == 0 || *step == 2 {
+		processFeeds(mgr)
+	}
 
-	// 4. 抓取正文与生成摘要
-	log.Printf("开始处理正文与 AI 摘要 (并发数: %d)...", *concurrency)
-	processContentAndLLM(mgr)
+	// Step 3: 正文抓取
+	if *step == 0 || *step == 3 {
+		processContent(mgr)
+	}
 
-	log.Println("所有任务执行完毕。")
+	// Step 4: LLM 摘要
+	if *step == 0 || *step == 4 {
+		processLLM(mgr)
+	}
+
+	log.Println("所有指定任务执行完毕。")
 }
