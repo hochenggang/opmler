@@ -150,7 +150,8 @@ func doRequest(method, reqUrl string, body io.Reader, headers map[string]string)
 		lastErr = err
 		// 指数退避: 1s, 2s, 4s
 		sleepDuration := time.Duration(math.Pow(2, float64(i))) * time.Second
-		log.Printf("网络请求失败 [%s]: %v. %v 后重试...", reqUrl, err, sleepDuration)
+		// 只有不是最后一次尝试时才 log，避免刷屏，或者保留 log
+		// log.Printf("网络请求失败 [%s]: %v. %v 后重试...", reqUrl, err, sleepDuration)
 		time.Sleep(sleepDuration)
 	}
 
@@ -243,8 +244,7 @@ func initDB() (*DBManager, error) {
 		return nil, fmt.Errorf("创建 llm_store 表失败: %v", err)
 	}
 
-	// 5. Keyword 表 (新增：用于关键词反查)
-	// 使用 keyword 和 article_key 联合唯一索引，防止重复
+	// 5. Keyword 表 (用于关键词反查)
 	_, err = mgr.DB.Exec(`CREATE TABLE IF NOT EXISTS keyword_store (
 		id BIGINT AUTO_INCREMENT PRIMARY KEY,
 		keyword VARCHAR(100) NOT NULL,
@@ -561,7 +561,31 @@ func processLLM(mgr *DBManager) {
 	log.Println("[步骤4] 摘要生成与关键词提取完成")
 }
 
-// 调用 LLM API (带格式验证的重试逻辑)
+// 辅助函数：清洗 LLM 返回的字符串
+func cleanLLMContent(raw string) string {
+	lines := strings.Split(raw, "\n")
+	var cleanLines []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		// 移除 Markdown 代码块标记，如 ``` 或 ```json
+		if strings.HasPrefix(trimmed, "```") {
+			continue
+		}
+		cleanLines = append(cleanLines, line)
+	}
+	result := strings.Join(cleanLines, "\n")
+	
+	// 为了更安全，只截取第一个 { 和最后一个 } 之间的内容
+	start := strings.Index(result, "{")
+	end := strings.LastIndex(result, "}")
+	if start != -1 && end != -1 && end > start {
+		return result[start : end+1]
+	}
+
+	return result
+}
+
+// 调用 LLM API (带 Key 轮询和格式验证的重试逻辑)
 func callLLM(articleContent string) (*LLMResult, error) {
 	// 简单截断防止 Token 溢出
 	if len(articleContent) > 12000 {
@@ -583,74 +607,103 @@ func callLLM(articleContent string) (*LLMResult, error) {
 
 	jsonPayload, _ := json.Marshal(payload)
 
-	apiKey := ""
-	if len(llmConf.ApiKeys) > 0 {
-		apiKey = llmConf.ApiKeys[rand.Intn(len(llmConf.ApiKeys))]
-	}
+	// 获取所有 Key 并打乱顺序（简单的负载均衡）
+	apiKeys := make([]string, len(llmConf.ApiKeys))
+	copy(apiKeys, llmConf.ApiKeys)
+	rand.Shuffle(len(apiKeys), func(i, j int) { apiKeys[i], apiKeys[j] = apiKeys[j], apiKeys[i] })
 
-	headers := map[string]string{
-		"Content-Type":  "application/json",
-		"Authorization": apiKey,
-	}
-
-	// 格式验证重试循环 (最多3次)
 	var lastErr error
-	for i := 0; i < 3; i++ {
-		// 发起网络请求 (doRequest 内部已有网络层面的重试)
-		respBytes, err := doRequest("POST", llmConf.Server, bytes.NewBuffer(jsonPayload), headers)
-		if err != nil {
-			return nil, err // 网络彻底失败，直接返回
+
+	// --- 核心改动：外层循环遍历 Key ---
+	for keyIdx, apiKey := range apiKeys {
+		// 掩码用于日志，避免泄露完整 Key
+		maskedKey := "unknown"
+		if len(apiKey) > 8 {
+			maskedKey = apiKey[:8] + "..."
 		}
 
-		// 解析 OpenAI 格式响应
-		var resp struct {
-			Choices []struct {
-				Message struct {
-					Content string `json:"content"`
-				} `json:"message"`
-			} `json:"choices"`
-			Error struct {
-				Message string `json:"message"`
-			} `json:"error"`
+		headers := map[string]string{
+			"Content-Type":  "application/json",
+			"Authorization": apiKey,
 		}
 
-		if err := json.Unmarshal(respBytes, &resp); err != nil {
-			lastErr = fmt.Errorf("API 响应非 JSON: %v", err)
-			log.Printf("LLM API 响应解析失败 (第 %d 次重试): %v", i+1, lastErr)
-			continue
+		// 内层循环：针对当前 Key 进行重试 (主要解决 JSON 格式错误)
+		// 注意：doRequest 内部已经包含了针对网络错误 (429/5xx) 的 3 次重试。
+		// 如果 doRequest 返回错误，意味着这个 Key 在网络层面已经失败了 3 次，应该切换 Key。
+		// 如果 doRequest 返回成功，但 JSON 格式错误，我们在内层循环重试最多 3 次。
+		
+		for attempt := 0; attempt < 3; attempt++ {
+			
+			// 调用网络请求 (doRequest 内部有 3 次网络重试)
+			respBytes, err := doRequest("POST", llmConf.Server, bytes.NewBuffer(jsonPayload), headers)
+			
+			if err != nil {
+				// 如果 doRequest 失败，说明网络层面不可用 (例如 429 超过重试次数)
+				// 此时不应在内层循环重试，而应直接跳出内层循环，进入下一个 Key
+				lastErr = fmt.Errorf("Key [%s] 网络/额度耗尽: %v", maskedKey, err)
+				log.Printf("切换 Key 警告: %v", lastErr)
+				break // Break inner loop -> Next Key
+			}
+
+			// 解析 OpenAI 格式响应
+			var resp struct {
+				Choices []struct {
+					Message struct {
+						Content string `json:"content"`
+					} `json:"message"`
+				} `json:"choices"`
+				Error struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+
+			if err := json.Unmarshal(respBytes, &resp); err != nil {
+				// API 返回了非 JSON 格式 (极少见，可能是服务崩溃)
+				lastErr = fmt.Errorf("Key [%s] 响应非 JSON: %v", maskedKey, err)
+				// 这种情况可以重试 (attempt++)
+				continue 
+			}
+
+			if resp.Error.Message != "" {
+				// API 返回了业务错误 (如 key 无效)
+				lastErr = fmt.Errorf("Key [%s] API 报错: %s", maskedKey, resp.Error.Message)
+				log.Printf("切换 Key 警告: %v", lastErr)
+				// 业务错误通常重试无效，直接换 Key
+				break 
+			}
+
+			if len(resp.Choices) == 0 {
+				lastErr = fmt.Errorf("Key [%s] 返回空 Choices", maskedKey)
+				continue
+			}
+
+			rawContent := resp.Choices[0].Message.Content
+
+			// 清洗 Markdown 标记并提取 JSON
+			cleanContent := cleanLLMContent(rawContent)
+
+			var result LLMResult
+			if err := json.Unmarshal([]byte(cleanContent), &result); err != nil {
+				lastErr = fmt.Errorf("Key [%s] 内容格式错误: %v", maskedKey, err)
+				// JSON 格式不对，可以在当前 Key 重试生成 (attempt++)
+				continue
+			}
+
+			// 字段完整性验证
+			if len(result.Keywords) == 0 || result.Summary == "" {
+				lastErr = fmt.Errorf("Key [%s] 缺少 keywords 或 summary", maskedKey)
+				continue
+			}
+
+			// 成功！直接返回
+			return &result, nil
 		}
-
-		if resp.Error.Message != "" {
-			return nil, fmt.Errorf("API 报错: %s", resp.Error.Message)
-		}
-
-		if len(resp.Choices) == 0 {
-			lastErr = fmt.Errorf("API 返回空 Choices")
-			continue
-		}
-
-		contentStr := resp.Choices[0].Message.Content
-
-		// --- 核心改动：验证内容是否符合业务 JSON 要求 ---
-		var result LLMResult
-		if err := json.Unmarshal([]byte(contentStr), &result); err != nil {
-			lastErr = fmt.Errorf("内容非目标 JSON 格式: %v", err)
-			log.Printf("LLM 内容格式错误 (第 %d 次重试): %v", i+1, lastErr)
-			continue
-		}
-
-		// 字段完整性验证
-		if len(result.Keywords) == 0 || result.Summary == "" {
-			lastErr = fmt.Errorf("缺少 keywords 或 summary 字段")
-			log.Printf("LLM 字段缺失 (第 %d 次重试): %v", i+1, lastErr)
-			continue
-		}
-
-		// 验证通过，返回结果
-		return &result, nil
+		
+		// 如果内层循环结束仍未返回，说明当前 Key 失败了，外层循环会自动尝试下一个 Key
+		log.Printf("Key [%s] 尝试 %d 次后失败，切换下一个 Key (剩余 %d 个)", maskedKey, 3, len(apiKeys)-1-keyIdx)
 	}
 
-	return nil, fmt.Errorf("LLM 处理失败，超过3次重试: %v", lastErr)
+	return nil, fmt.Errorf("所有 API Key 均已尝试并失败: %v", lastErr)
 }
 
 // --- 主程序入口 ---
