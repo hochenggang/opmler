@@ -662,7 +662,7 @@ func main() {
 	flag.Parse()
 
 	// --- 新增: 配置日志输出到文件和控制台 ---
-	logFile, err := os.OpenFile("./log.txt", os.O_CREATE|O_WRONLY|O_APPEND, 0666)
+	logFile, err := os.OpenFile("./log.txt", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		fmt.Printf("无法打开日志文件: %v\n", err)
 		return
