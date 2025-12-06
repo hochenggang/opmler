@@ -64,6 +64,12 @@ type OPML struct {
 	} `xml:"body"`
 }
 
+// LLMResult 定义 LLM 返回的期望 JSON 结构
+type LLMResult struct {
+	Keywords []string `json:"keywords"`
+	Summary  string   `json:"summary"`
+}
+
 // --- 全局变量与工具 ---
 
 var (
@@ -89,9 +95,15 @@ func initNetwork() {
 	}
 }
 
-// 指数退避重试请求
+// 指数退避重试请求 (网络层面的重试)
 func doRequest(method, reqUrl string, body io.Reader, headers map[string]string) ([]byte, error) {
 	var lastErr error
+
+	// 为了防止 body 在重试时被耗尽，如果 body 不为空，需要读取并在每次请求时重建 Reader
+	var bodyBytes []byte
+	if body != nil {
+		bodyBytes, _ = io.ReadAll(body)
+	}
 
 	for i := 0; i < 3; i++ {
 		// 创建基础 Client
@@ -104,15 +116,19 @@ func doRequest(method, reqUrl string, body io.Reader, headers map[string]string)
 			proxyUrlStr := proxies[rand.Intn(len(proxies))]
 			proxyUrl, err := url.Parse(proxyUrlStr)
 			if err == nil {
-				// 只有当解析成功时才设置 Transport
 				client.Transport = &http.Transport{
 					Proxy: http.ProxyURL(proxyUrl),
 				}
 			}
 		}
-		// 如果没有代理，client.Transport 保持为 nil，Go 会自动使用 DefaultTransport
 
-		req, err := http.NewRequest(method, reqUrl, body)
+		// 重建 Body Reader
+		var reqBody io.Reader
+		if bodyBytes != nil {
+			reqBody = bytes.NewBuffer(bodyBytes)
+		}
+
+		req, err := http.NewRequest(method, reqUrl, reqBody)
 		if err != nil {
 			return nil, err
 		}
@@ -134,11 +150,11 @@ func doRequest(method, reqUrl string, body io.Reader, headers map[string]string)
 		lastErr = err
 		// 指数退避: 1s, 2s, 4s
 		sleepDuration := time.Duration(math.Pow(2, float64(i))) * time.Second
-		log.Printf("请求失败 [%s]: %v. %v 后重试...", reqUrl, err, sleepDuration)
+		log.Printf("网络请求失败 [%s]: %v. %v 后重试...", reqUrl, err, sleepDuration)
 		time.Sleep(sleepDuration)
 	}
 
-	return nil, fmt.Errorf("request failed after 3 retries: %v", lastErr)
+	return nil, fmt.Errorf("network request failed after 3 retries: %v", lastErr)
 }
 
 // 生成大写 MD5
@@ -164,7 +180,7 @@ func initDB() (*DBManager, error) {
 		return nil, fmt.Errorf("解析 db.json 失败: %v", err)
 	}
 
-	// 构建 DSN (Data Source Name)
+	// 构建 DSN
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=%s&parseTime=True&loc=Local",
 		cfg.MySQL.User,
 		cfg.MySQL.Password,
@@ -179,7 +195,6 @@ func initDB() (*DBManager, error) {
 		return nil, err
 	}
 
-	// 测试连接
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("连接数据库失败: %v", err)
 	}
@@ -187,7 +202,7 @@ func initDB() (*DBManager, error) {
 
 	mgr := &DBManager{DB: db}
 
-	// 创建 RSS 表 (适配 MySQL: 使用 VARCHAR 作为主键)
+	// 1. RSS 表
 	_, err = mgr.DB.Exec(`CREATE TABLE IF NOT EXISTS rss (
 		rss_host VARCHAR(255) PRIMARY KEY,
 		rss_title VARCHAR(255),
@@ -198,7 +213,7 @@ func initDB() (*DBManager, error) {
 		return nil, fmt.Errorf("创建 rss 表失败: %v", err)
 	}
 
-	// 创建 Article 表
+	// 2. Article 表
 	_, err = mgr.DB.Exec(`CREATE TABLE IF NOT EXISTS article (
 		article_key CHAR(32) PRIMARY KEY,
 		article_link TEXT,
@@ -210,7 +225,7 @@ func initDB() (*DBManager, error) {
 		return nil, fmt.Errorf("创建 article 表失败: %v", err)
 	}
 
-	// 创建 Content 表
+	// 3. Content 表
 	_, err = mgr.DB.Exec(`CREATE TABLE IF NOT EXISTS content_store (
 		article_key CHAR(32) PRIMARY KEY,
 		value LONGTEXT
@@ -219,13 +234,26 @@ func initDB() (*DBManager, error) {
 		return nil, fmt.Errorf("创建 content_store 表失败: %v", err)
 	}
 
-	// 创建 LLM 表
+	// 4. LLM 表 (存储完整 JSON 响应)
 	_, err = mgr.DB.Exec(`CREATE TABLE IF NOT EXISTS llm_store (
 		article_key CHAR(32) PRIMARY KEY,
 		value TEXT
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
 	if err != nil {
 		return nil, fmt.Errorf("创建 llm_store 表失败: %v", err)
+	}
+
+	// 5. Keyword 表 (新增：用于关键词反查)
+	// 使用 keyword 和 article_key 联合唯一索引，防止重复
+	_, err = mgr.DB.Exec(`CREATE TABLE IF NOT EXISTS keyword_store (
+		id BIGINT AUTO_INCREMENT PRIMARY KEY,
+		keyword VARCHAR(100) NOT NULL,
+		article_key CHAR(32) NOT NULL,
+		INDEX idx_keyword (keyword),
+		UNIQUE KEY unique_key_article (keyword, article_key)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+	if err != nil {
+		return nil, fmt.Errorf("创建 keyword_store 表失败: %v", err)
 	}
 
 	return mgr, nil
@@ -239,7 +267,7 @@ func (mgr *DBManager) Close() {
 
 // --- 核心业务逻辑 ---
 
-// 步骤 1: 获取 OPML 并入库 (串行)
+// 步骤 1: 获取 OPML 并入库
 func processOPML(opmlUrl string, mgr *DBManager) error {
 	log.Println("[步骤1] 正在获取 OPML...", opmlUrl)
 	data, err := doRequest("GET", opmlUrl, nil, nil)
@@ -252,7 +280,6 @@ func processOPML(opmlUrl string, mgr *DBManager) error {
 		return err
 	}
 
-	// 使用 REPLACE INTO 处理重复更新
 	stmt, err := mgr.DB.Prepare("REPLACE INTO rss (rss_host, rss_title, rss_url, update_at) VALUES (?, ?, ?, ?)")
 	if err != nil {
 		return err
@@ -286,7 +313,7 @@ func processOPML(opmlUrl string, mgr *DBManager) error {
 	return nil
 }
 
-// 步骤 2: 遍历 RSS 并采集文章元数据 (并发)
+// 步骤 2: 遍历 RSS 并采集文章元数据
 func processFeeds(mgr *DBManager) {
 	log.Println("[步骤2] 开始解析 RSS 订阅源...")
 	rows, err := mgr.DB.Query("SELECT rss_host, rss_url FROM rss")
@@ -339,7 +366,6 @@ func processFeeds(mgr *DBManager) {
 				}
 				u, err := url.Parse(link)
 				if err == nil {
-					// 补全相对路径链接
 					if u.Scheme == "" || u.Host == "" {
 						if !strings.HasPrefix(link, "http") {
 							scheme := "https"
@@ -383,7 +409,7 @@ func processFeeds(mgr *DBManager) {
 	log.Println("[步骤2] RSS 解析完成")
 }
 
-// 步骤 3: 获取正文 -> 转 Markdown (并发)
+// 步骤 3: 获取正文 -> 转 Markdown
 func processContent(mgr *DBManager) {
 	log.Println("[步骤3] 开始抓取正文并清洗为 Markdown...")
 	rows, err := mgr.DB.Query("SELECT article_key, article_link, article_title FROM article")
@@ -416,11 +442,8 @@ func processContent(mgr *DBManager) {
 			defer wg.Done()
 			defer func() { <-concurrencySem }()
 
-			// 检查是否已存在正文
 			var exists int
 			err := mgr.DB.QueryRow("SELECT 1 FROM content_store WHERE article_key = ?", taskItem.Key).Scan(&exists)
-			
-			// 如果存在则跳过
 			if err == nil {
 				return
 			}
@@ -432,7 +455,6 @@ func processContent(mgr *DBManager) {
 				return
 			}
 
-			// 转 Markdown
 			converter := md.NewConverter("", true, nil)
 			markdown, err := converter.ConvertString(string(htmlBytes))
 			if err != nil {
@@ -440,7 +462,6 @@ func processContent(mgr *DBManager) {
 				markdown = "Conversion Failed"
 			}
 
-			// 存储
 			_, err = mgr.DB.Exec("REPLACE INTO content_store (article_key, value) VALUES (?, ?)", taskItem.Key, markdown)
 			if err != nil {
 				log.Printf("Content 存储失败: %v", err)
@@ -451,10 +472,9 @@ func processContent(mgr *DBManager) {
 	log.Println("[步骤3] 正文抓取完成")
 }
 
-// 步骤 4: 读取正文 -> 生成 LLM 摘要 (并发)
+// 步骤 4: 读取正文 -> 生成 LLM 摘要并提取关键词
 func processLLM(mgr *DBManager) {
 	log.Println("[步骤4] 开始生成 LLM 摘要...")
-	// 加载 LLM 配置
 	llmData, err := os.ReadFile("./llm.json")
 	if err != nil {
 		log.Printf("跳过 LLM 步骤: 无法读取 llm.json: %v", err)
@@ -463,8 +483,6 @@ func processLLM(mgr *DBManager) {
 	llmConf = &LLMConfig{}
 	json.Unmarshal(llmData, llmConf)
 
-	// 只查询有正文且未生成摘要的文章
-	// 为了方便日志显示标题，我们联表查询，或者这里简单点：查询 article 表，然后查 content
 	rows, err := mgr.DB.Query("SELECT article_key, article_link, article_title FROM article")
 	if err != nil {
 		log.Println(err)
@@ -505,37 +523,52 @@ func processLLM(mgr *DBManager) {
 			// 2. 获取正文 Markdown
 			var content string
 			err = mgr.DB.QueryRow("SELECT value FROM content_store WHERE article_key = ?", taskItem.Key).Scan(&content)
-			
-			// 如果没有正文或正文太短，无法生成摘要
 			if err != nil || len(content) < 50 {
 				return
 			}
 
-			// 调用 LLM
-			log.Printf("正在生成摘要: %s", taskItem.Title)
-			summary, err := callLLM(content)
+			// 3. 调用 LLM (带结构化重试机制)
+			log.Printf("正在分析文章: %s", taskItem.Title)
+			result, err := callLLM(content)
 			if err != nil {
-				log.Printf("LLM 调用失败 [%s]: %v", taskItem.Title, err)
+				log.Printf("LLM 处理失败 (已跳过) [%s]: %v", taskItem.Title, err)
 				return
 			}
 
-			_, err = mgr.DB.Exec("REPLACE INTO llm_store (article_key, value) VALUES (?, ?)", taskItem.Key, summary)
+			// 4. 存储完整的 JSON 结果到 llm_store
+			jsonBytes, _ := json.Marshal(result)
+			_, err = mgr.DB.Exec("REPLACE INTO llm_store (article_key, value) VALUES (?, ?)", taskItem.Key, string(jsonBytes))
 			if err != nil {
 				log.Printf("LLM 结果存储失败: %v", err)
 			}
+
+			// 5. 存储关键词到 keyword_store (便于反查)
+			for _, kw := range result.Keywords {
+				// 简单的清洗：去除首尾空格
+				kw = strings.TrimSpace(kw)
+				if kw != "" {
+					// 插入关键词映射，忽略重复
+					_, err := mgr.DB.Exec("INSERT IGNORE INTO keyword_store (keyword, article_key) VALUES (?, ?)", kw, taskItem.Key)
+					if err != nil {
+						log.Printf("关键词存储失败 [%s]: %v", kw, err)
+					}
+				}
+			}
+
 		}(t)
 	}
 	wg.Wait()
-	log.Println("[步骤4] 摘要生成完成")
+	log.Println("[步骤4] 摘要生成与关键词提取完成")
 }
 
-// 调用 LLM API
-func callLLM(articleContent string) (string, error) {
+// 调用 LLM API (带格式验证的重试逻辑)
+func callLLM(articleContent string) (*LLMResult, error) {
 	// 简单截断防止 Token 溢出
 	if len(articleContent) > 12000 {
 		articleContent = articleContent[:12000]
 	}
 
+	// 构造 Payload，强制 JSON 模式
 	payload := map[string]interface{}{
 		"model": llmConf.Model,
 		"messages": []map[string]string{
@@ -543,6 +576,9 @@ func callLLM(articleContent string) (string, error) {
 			{"role": "user", "content": articleContent},
 		},
 		"stream": false,
+		"response_format": map[string]string{
+			"type": "json_object",
+		},
 	}
 
 	jsonPayload, _ := json.Marshal(payload)
@@ -557,35 +593,64 @@ func callLLM(articleContent string) (string, error) {
 		"Authorization": apiKey,
 	}
 
-	respBytes, err := doRequest("POST", llmConf.Server, bytes.NewBuffer(jsonPayload), headers)
-	if err != nil {
-		return "", err
+	// 格式验证重试循环 (最多3次)
+	var lastErr error
+	for i := 0; i < 3; i++ {
+		// 发起网络请求 (doRequest 内部已有网络层面的重试)
+		respBytes, err := doRequest("POST", llmConf.Server, bytes.NewBuffer(jsonPayload), headers)
+		if err != nil {
+			return nil, err // 网络彻底失败，直接返回
+		}
+
+		// 解析 OpenAI 格式响应
+		var resp struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+
+		if err := json.Unmarshal(respBytes, &resp); err != nil {
+			lastErr = fmt.Errorf("API 响应非 JSON: %v", err)
+			log.Printf("LLM API 响应解析失败 (第 %d 次重试): %v", i+1, lastErr)
+			continue
+		}
+
+		if resp.Error.Message != "" {
+			return nil, fmt.Errorf("API 报错: %s", resp.Error.Message)
+		}
+
+		if len(resp.Choices) == 0 {
+			lastErr = fmt.Errorf("API 返回空 Choices")
+			continue
+		}
+
+		contentStr := resp.Choices[0].Message.Content
+
+		// --- 核心改动：验证内容是否符合业务 JSON 要求 ---
+		var result LLMResult
+		if err := json.Unmarshal([]byte(contentStr), &result); err != nil {
+			lastErr = fmt.Errorf("内容非目标 JSON 格式: %v", err)
+			log.Printf("LLM 内容格式错误 (第 %d 次重试): %v", i+1, lastErr)
+			continue
+		}
+
+		// 字段完整性验证
+		if len(result.Keywords) == 0 || result.Summary == "" {
+			lastErr = fmt.Errorf("缺少 keywords 或 summary 字段")
+			log.Printf("LLM 字段缺失 (第 %d 次重试): %v", i+1, lastErr)
+			continue
+		}
+
+		// 验证通过，返回结果
+		return &result, nil
 	}
 
-	var resp struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-
-	if err := json.Unmarshal(respBytes, &resp); err != nil {
-		return "", err
-	}
-
-	if resp.Error.Message != "" {
-		return "", fmt.Errorf("api error: %s", resp.Error.Message)
-	}
-
-	if len(resp.Choices) > 0 {
-		return resp.Choices[0].Message.Content, nil
-	}
-
-	return "", fmt.Errorf("no response content")
+	return nil, fmt.Errorf("LLM 处理失败，超过3次重试: %v", lastErr)
 }
 
 // --- 主程序入口 ---
@@ -596,13 +661,24 @@ func main() {
 	step := flag.Int("step", 0, "运行步骤: 0=全部, 1=获取OPML, 2=解析RSS, 3=抓取正文, 4=LLM摘要")
 	flag.Parse()
 
-	// 仅在步骤 0 或 1 且未提供 URL 时报错
+	// --- 新增: 配置日志输出到文件和控制台 ---
+	logFile, err := os.OpenFile("./log.txt", os.O_CREATE|O_WRONLY|O_APPEND, 0666)
+	if err != nil {
+		fmt.Printf("无法打开日志文件: %v\n", err)
+		return
+	}
+	defer logFile.Close()
+
+	// 使用 MultiWriter 同时输出到标准输出和文件
+	multiWriter := io.MultiWriter(os.Stdout, logFile)
+	log.SetOutput(multiWriter)
+	// -------------------------------------
+
 	if (*step == 0 || *step == 1) && *opmlUrl == "" {
 		fmt.Println("错误: 运行步骤 0 或 1 时必须提供 -url 参数")
 		return
 	}
 
-	// 初始化并发信号量
 	if *concurrency < 1 {
 		*concurrency = 1
 	}
@@ -618,27 +694,20 @@ func main() {
 	}
 	defer mgr.Close()
 
-	// 步骤分发逻辑
-	// 如果是 0，则所有条件都满足；如果是具体数字，则只满足对应条件
-	
-	// Step 1: OPML 获取
 	if *step == 0 || *step == 1 {
 		if err := processOPML(*opmlUrl, mgr); err != nil {
 			log.Fatalf("处理 OPML 失败: %v", err)
 		}
 	}
 
-	// Step 2: RSS 解析
 	if *step == 0 || *step == 2 {
 		processFeeds(mgr)
 	}
 
-	// Step 3: 正文抓取
 	if *step == 0 || *step == 3 {
 		processContent(mgr)
 	}
 
-	// Step 4: LLM 摘要
 	if *step == 0 || *step == 4 {
 		processLLM(mgr)
 	}
