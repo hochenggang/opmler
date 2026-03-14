@@ -28,7 +28,7 @@ import (
 const (
 	maxRetries      = 3
 	retryDelayBase  = 2
-	httpTimeout     = 120 * time.Second
+	httpTimeout     = 30 * time.Second
 	llmContentLimit = 12000
 )
 
@@ -270,16 +270,7 @@ func md5Hash(s string) string {
 func (a *App) step1_FetchOPML(opmlURL string) error {
 	log.Println("[步骤1] 获取 OPML...")
 
-	var data []byte
-	var err error
-	for i := 0; i < maxRetries; i++ {
-		data, err = a.httpRequest("GET", opmlURL, nil, nil)
-		if err == nil {
-			break
-		}
-		log.Printf("  OPML 获取失败 (%d/%d): %v", i+1, maxRetries, err)
-		time.Sleep(time.Duration(retryDelayBase<<(i+1)) * time.Second)
-	}
+	data, err := a.httpRequest("GET", opmlURL, nil, nil)
 	if err != nil {
 		return fmt.Errorf("获取 OPML 失败: %v", err)
 	}
@@ -353,18 +344,7 @@ func (a *App) step2_FetchFeeds() {
 	for i, f := range feeds {
 		log.Printf("[%d/%d] %s", i+1, len(feeds), f.url)
 
-		var data []byte
-		var err error
-		for retry := 0; retry < maxRetries; retry++ {
-			data, err = a.httpRequest("GET", f.url, nil, nil)
-			if err == nil {
-				break
-			}
-			if retry < maxRetries-1 {
-				time.Sleep(time.Duration(retryDelayBase<<retry) * time.Second)
-			}
-		}
-
+		data, err := a.httpRequest("GET", f.url, nil, nil)
 		if err != nil {
 			log.Printf("  -> 获取失败: %v", err)
 			failCount++
@@ -465,18 +445,7 @@ func (a *App) step3_FetchContent() {
 
 		log.Printf("[%d/%d] %s", i+1, len(articles), art.title)
 
-		var html []byte
-		var err error
-		for retry := 0; retry < maxRetries; retry++ {
-			html, err = a.httpRequest("GET", art.link, nil, nil)
-			if err == nil {
-				break
-			}
-			if retry < maxRetries-1 {
-				time.Sleep(time.Duration(retryDelayBase<<retry) * time.Second)
-			}
-		}
-
+		html, err := a.httpRequest("GET", art.link, nil, nil)
 		if err != nil {
 			log.Printf("  -> 抓取失败: %v", err)
 			failCount++

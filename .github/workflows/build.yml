@@ -1,5 +1,5 @@
-name: Build and Release RSS Collector
-
+name: Build and Release Opmler
+ 
 # 触发条件修改：
 # 1. 当推送类似 'v*' 的标签时触发（例如 v1.0.0），用于正式发布
 # 2. workflow_dispatch 用于手动测试
@@ -21,11 +21,11 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         include:
           - os: ubuntu-latest
-            output_name: rss_collector_linux_amd64
+            output_name: opmler_linux_amd64
           - os: windows-latest
-            output_name: rss_collector_windows_amd64.exe
+            output_name: opmler_windows_amd64.exe
           - os: macos-latest
-            output_name: rss_collector_darwin_amd64
+            output_name: opmler_darwin_amd64
 
     steps:
     - uses: actions/checkout@v4
@@ -38,9 +38,9 @@ jobs:
     - name: Init and Download dependencies
       run: |
         # 注意：如果有 go.mod 建议提交到仓库，而不是每次 init
-        # 这里保留你的逻辑以确保运行
+        # 这里保留你的逻辑以确保运行时能正常工作
         if [ ! -f "go.mod" ]; then
-          go mod init rss-collector
+          go mod init opmler
           go mod tidy
         else 
           echo "go.mod exists, just tidying"
