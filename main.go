@@ -447,7 +447,8 @@ func (a *App) step3_FetchContent() {
 
 		html, err := a.httpRequest("GET", art.link, nil, nil)
 		if err != nil {
-			log.Printf("  -> 抓取失败: %v", err)
+			log.Printf("  -> 抓取失败，删除文章: %v", err)
+			a.db.Exec("DELETE FROM article WHERE article_key = ?", art.key)
 			failCount++
 			continue
 		}
