@@ -17,12 +17,15 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	md "github.com/JohannesKaufmann/html-to-markdown"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/mmcdole/gofeed"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
 )
 
 const (
@@ -48,6 +51,30 @@ type Config struct {
 		Model   string   `json:"model"`
 		Prompt  string   `json:"prompt"`
 	} `json:"llm"`
+}
+
+var (
+	utf8BOM     = []byte{0xEF, 0xBB, 0xBF}
+	gb2312Regex = regexp.MustCompile(`(?i)charset=["']?gb2312["']?`)
+	gbkRegex    = regexp.MustCompile(`(?i)charset=["']?gbk["']?`)
+	latin1Regex = regexp.MustCompile(`(?i)charset=["']?(?:latin1|iso-8859-1)["']?`)
+)
+
+func convertToUTF8(html []byte) []byte {
+	if bytes.HasPrefix(html, utf8BOM) {
+		return html[len(utf8BOM):]
+	}
+
+	htmlStr := string(html)
+	if gb2312Regex.MatchString(htmlStr) || gbkRegex.MatchString(htmlStr) {
+		reader := transform.NewReader(bytes.NewReader(html), simplifiedchinese.GBK.NewDecoder())
+		converted, err := io.ReadAll(reader)
+		if err == nil {
+			return converted
+		}
+	}
+
+	return html
 }
 
 type OPML struct {
@@ -124,7 +151,19 @@ func (a *App) loadConfig() error {
 
 	llmPath := a.configPath("llm.json")
 	if data, err = os.ReadFile(llmPath); err == nil {
-		json.Unmarshal(data, &a.config)
+		var llmConf struct {
+			Server  string   `json:"server"`
+			ApiKeys []string `json:"api_keys"`
+			Model   string   `json:"model"`
+			Prompt  string   `json:"prompt"`
+		}
+		if json.Unmarshal(data, &llmConf) == nil && llmConf.Server != "" {
+			a.config.LLM.Server = llmConf.Server
+			a.config.LLM.ApiKeys = llmConf.ApiKeys
+			a.config.LLM.Model = llmConf.Model
+			a.config.LLM.Prompt = llmConf.Prompt
+			log.Printf("加载 LLM 配置: Server=%s, Model=%s", llmConf.Server, llmConf.Model)
+		}
 	}
 
 	return nil
@@ -455,6 +494,8 @@ func (a *App) step3_FetchContent() {
 			failCount++
 			continue
 		}
+
+		html = convertToUTF8(html)
 
 		markdown := "Conversion Failed"
 		func() {
