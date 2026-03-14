@@ -372,6 +372,9 @@ func (a *App) step2_FetchFeeds() {
 				if strings.HasPrefix(f.url, "http:") {
 					scheme = "http"
 				}
+				if !strings.HasPrefix(link, "/") {
+					link = "/" + link
+				}
 				link = fmt.Sprintf("%s://%s%s", scheme, f.host, link)
 			}
 
